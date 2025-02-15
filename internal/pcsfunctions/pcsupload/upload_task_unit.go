@@ -2,6 +2,7 @@ package pcsupload
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -33,8 +34,8 @@ type (
 		PCS               *baidupcs.BaiduPCS
 		UploadingDatabase *UploadingDatabase // 数据库
 		Parallel          int
-		NoRapidUpload     bool // 禁用秒传
-		NoSplitFile       bool // 禁用分片上传
+		NoRapidUpload     bool   // 禁用秒传
+		NoSplitFile       bool   // 禁用分片上传
 		Policy            string // 上传重名文件策略
 
 		UploadStatistic *UploadStatistic
@@ -56,8 +57,9 @@ const (
 )
 
 const (
-	StrUploadFailed = "上传文件失败"
+	StrUploadFailed    = "上传文件失败"
 	DefaultPrintFormat = "\r[%s] ↑ %s/%s %s/s in %s ............"
+	DefaultContentSize = 4 * converter.KB
 )
 
 func (utu *UploadTaskUnit) SetTaskInfo(taskInfo *taskframework.TaskInfo) {
@@ -85,11 +87,13 @@ func (utu *UploadTaskUnit) prepareFile() {
 		return
 	}
 
-	if utu.LocalFileChecksum.Length > baidupcs.MaxRapidUploadSize {
-		fmt.Printf("[%s] 文件超过20GB, 无法使用秒传功能, 跳过秒传...\n", utu.taskInfo.Id())
-		utu.Step = StepUploadUpload
-		return
-	}
+	// 秒传不分文件大小一律进行
+
+	//if utu.LocalFileChecksum.Length > baidupcs.MaxRapidUploadSize {
+	//	fmt.Printf("[%s] 文件超过20GB, 无法使用秒传功能, 跳过秒传...\n", utu.taskInfo.Id())
+	//	utu.Step = StepUploadUpload
+	//	return
+	//}
 	// 下一步: 秒传
 	utu.Step = StepUploadRapidUpload
 }
@@ -153,7 +157,32 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 		}
 	}
 
-	pcsError = utu.PCS.RapidUpload(utu.SavePath, hex.EncodeToString(utu.LocalFileChecksum.MD5), hex.EncodeToString(utu.LocalFileChecksum.SliceMD5), fmt.Sprint(utu.LocalFileChecksum.CRC32), utu.LocalFileChecksum.Length)
+	uk, err := utu.PCS.UK()
+	if err != nil {
+		result.ResultMessage = "获取用户uk错误, 请确保登录信息包含了STOKEN"
+		result.Err = err
+		fmt.Printf("[%s] 秒传失败, 开始上传文件...\n\n", utu.taskInfo.Id())
+		isContinue = true
+		return
+	}
+	currentTime := time.Now().Unix()
+	offset, err := creaetDataOffset(hex.EncodeToString(utu.LocalFileChecksum.MD5), uk, currentTime, utu.LocalFileChecksum.Length, DefaultContentSize)
+	if err != nil {
+		result.ResultMessage = "计算文件偏移量错误"
+		result.Err = err
+		return
+	}
+	dataContent, dataLength, err := utu.LocalFileChecksum.GetSliceDataContent(offset, DefaultContentSize)
+	if err != nil {
+		result.ResultMessage = "读取随机文件子片段错误"
+		result.Err = err
+		return
+	}
+	b64Content := strings.TrimRight(base64.StdEncoding.EncodeToString(dataContent), "=")
+	pcsError, uploadid := utu.PCS.RapidUpload(utu.SavePath, hex.EncodeToString(utu.LocalFileChecksum.MD5),
+		hex.EncodeToString(utu.LocalFileChecksum.SliceMD5), b64Content, fmt.Sprint(utu.LocalFileChecksum.CRC32),
+		offset, dataLength, utu.LocalFileChecksum.Length, currentTime)
+	utu.UploadingDatabase.Uploadid = uploadid
 	if pcsError == nil {
 		fmt.Printf("[%s] 秒传成功, 保存到网盘路径: %s\n\n", utu.taskInfo.Id(), utu.SavePath)
 		// 统计
@@ -172,7 +201,6 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 			return
 		}
 	}
-
 	fmt.Printf("[%s] 秒传失败, 开始上传文件...\n\n", utu.taskInfo.Id())
 
 	// 保存秒传信息
@@ -199,7 +227,7 @@ func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 		BlockSize: blockSize,
 		MaxRate:   pcsconfig.Config.MaxUploadRate,
 		Policy:    utu.Policy,
-	})
+	}, utu.UploadingDatabase.Uploadid)
 
 	// 设置断点续传
 	if utu.state != nil {
